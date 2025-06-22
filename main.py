@@ -633,6 +633,7 @@ async def health_check():
             "queue_length": queue_status["queue_length"],
             "success_rate": perf_stats["success_rate"],
             "avg_response_time": perf_stats["avg_response_time"],
+            "redis_connected": bool(user_limiter.redis_client),
             "api_key_configured": bool(processor.api_key)
         }
     except Exception as e:
