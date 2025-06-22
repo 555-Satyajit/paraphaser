@@ -6,6 +6,7 @@ import hashlib
 from typing import List, Dict, Optional
 from collections import defaultdict, deque
 from datetime import datetime, timedelta
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Depends, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -13,14 +14,21 @@ import logging
 import json
 from dotenv import load_dotenv
 import random
+import traceback
 
-# Configure logging
+# Configure logging with more detail
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
-load_dotenv()
+
+# Load environment variables
+try:
+    load_dotenv()
+    logger.info("Environment variables loaded successfully")
+except Exception as e:
+    logger.error(f"Error loading environment variables: {e}")
 
 # Pydantic models
 class ParaphraseRequest(BaseModel):
@@ -46,9 +54,10 @@ class RequestQueue:
         self.processing = False
         self.last_request_time = 0
         self.min_interval = 5.5  # 5.5 seconds between requests (safer than 5s)
+        logger.info("RequestQueue initialized")
     
     async def add_request(self, request_data, user_id):
-        """Add request to queue"""
+        """Add request to queue and return the result"""
         queue_item = {
             'request_data': request_data,
             'user_id': user_id,
@@ -56,12 +65,14 @@ class RequestQueue:
             'future': asyncio.Future()
         }
         self.queue.append(queue_item)
+        logger.info(f"Request added to queue for user {user_id}")
         
         # Start processing if not already running
         if not self.processing:
             asyncio.create_task(self.process_queue())
         
-        return queue_item['future']
+        # Wait for the future to complete and return the result
+        return await queue_item['future']
     
     async def process_queue(self):
         """Process queued requests with rate limiting"""
@@ -69,6 +80,7 @@ class RequestQueue:
             return
         
         self.processing = True
+        logger.info("Started processing queue")
         
         try:
             while self.queue:
@@ -80,6 +92,7 @@ class RequestQueue:
                 
                 if time_since_last < self.min_interval:
                     wait_time = self.min_interval - time_since_last
+                    logger.info(f"Rate limiting: waiting {wait_time:.2f} seconds")
                     await asyncio.sleep(wait_time)
                 
                 try:
@@ -89,19 +102,22 @@ class RequestQueue:
                         item['request_data'].num_variations
                     )
                     
-                    # Add queue info
+                    # Add queue info to the result dictionary
                     result['queue_position'] = 0
                     result['estimated_wait_time'] = 0.0
                     
                     item['future'].set_result(result)
+                    logger.info(f"Request processed successfully for user {item['user_id']}")
                     
                 except Exception as e:
+                    logger.error(f"Error processing request for user {item['user_id']}: {e}")
                     item['future'].set_exception(e)
                 
                 self.last_request_time = time.time()
                 
         finally:
             self.processing = False
+            logger.info("Queue processing completed")
     
     def get_queue_status(self):
         """Get current queue status"""
@@ -121,6 +137,7 @@ class UserRateLimiter:
         self.failed_requests = defaultdict(int)
         self.cleanup_interval = 3600  # Clean up old data every hour
         self.last_cleanup = time.time()
+        logger.info(f"UserRateLimiter initialized with daily limit: {self.daily_limit_per_user}")
 
     def cleanup_old_data(self):
         """Clean up old tracking data"""
@@ -129,6 +146,7 @@ class UserRateLimiter:
             # Remove old failed request counts
             self.failed_requests.clear()
             self.last_cleanup = current_time
+            logger.info("Cleaned up old rate limiter data")
 
     def get_user_id(self, request: Request) -> str:
         """Generate user ID from IP address and User-Agent for better uniqueness"""
@@ -153,6 +171,7 @@ class UserRateLimiter:
         
         # Check limit
         if user_data["count"] >= self.daily_limit_per_user:
+            logger.warning(f"User {user_id} exceeded daily limit")
             return False
         
         # Increment counter
@@ -172,6 +191,7 @@ class UserRateLimiter:
     def log_failed_request(self, user_id: str):
         """Log failed request (doesn't count against user limit)"""
         self.failed_requests[user_id] += 1
+        logger.warning(f"Failed request logged for user {user_id}")
 
 class GeminiProcessor:
     """Process text using Google Gemini API with improved error handling"""
@@ -179,7 +199,10 @@ class GeminiProcessor:
     def __init__(self):
         self.api_key = os.getenv('GEMINI_API_KEY')
         if not self.api_key:
+            logger.error("GEMINI_API_KEY environment variable is not set!")
             raise ValueError("GEMINI_API_KEY environment variable is required")
+        
+        logger.info("GEMINI_API_KEY found and loaded")
         
         self.base_url = "https://generativelanguage.googleapis.com/v1beta"
         self.model = "gemini-1.5-flash"
@@ -196,17 +219,24 @@ class GeminiProcessor:
         self.error_count = 0
         self.success_count = 0
         
+        logger.info(f"GeminiProcessor initialized with model: {self.model}")
+        
     async def get_session(self):
         if self.session is None:
-            connector = aiohttp.TCPConnector(
-                limit=10,
-                limit_per_host=5,
-                keepalive_timeout=30
-            )
-            self.session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=30),
-                connector=connector
-            )
+            try:
+                connector = aiohttp.TCPConnector(
+                    limit=10,
+                    limit_per_host=5,
+                    keepalive_timeout=30
+                )
+                self.session = aiohttp.ClientSession(
+                    timeout=aiohttp.ClientTimeout(total=30),
+                    connector=connector
+                )
+                logger.info("HTTP session created successfully")
+            except Exception as e:
+                logger.error(f"Error creating HTTP session: {e}")
+                raise
         return self.session
     
     def check_rate_limits(self):
@@ -225,6 +255,7 @@ class GeminiProcessor:
         
         # More conservative limits for stability
         if self.requests_count >= 10:  # 10/min instead of 12
+            logger.warning("Minute rate limit exceeded")
             raise HTTPException(
                 status_code=429,
                 detail={
@@ -235,6 +266,7 @@ class GeminiProcessor:
             )
         
         if self.daily_requests >= 1200:  # 1200/day instead of 1400 for buffer
+            logger.warning("Daily rate limit exceeded")
             raise HTTPException(
                 status_code=429,
                 detail={
@@ -263,6 +295,7 @@ class GeminiProcessor:
                     logger.warning(f"API call failed, retrying in {wait_time:.2f}s (attempt {attempt + 1}/{max_retries})")
                     await asyncio.sleep(wait_time)
             except Exception as e:
+                logger.error(f"API call error on attempt {attempt + 1}: {e}")
                 if attempt == max_retries - 1:
                     raise
                 else:
@@ -303,12 +336,16 @@ class GeminiProcessor:
                 "User-Agent": "Paraphraser-API/1.0"
             }
             
+            logger.info(f"Making API call to Gemini: {url}")
+            
             async with session.post(url, json=payload, headers=headers) as response:
                 response_time = time.time() - start_time
                 self.response_times.append(response_time)
                 
                 self.requests_count += 1
                 self.daily_requests += 1
+                
+                logger.info(f"API response status: {response.status}, time: {response_time:.3f}s")
                 
                 if response.status == 200:
                     result = await response.json()
@@ -321,6 +358,7 @@ class GeminiProcessor:
                             tokens_used = result['usageMetadata'].get('totalTokenCount', 0)
                         
                         self.success_count += 1
+                        logger.info("API call successful")
                         
                         return {
                             'content': content.strip(),
@@ -330,11 +368,13 @@ class GeminiProcessor:
                         }
                     else:
                         self.error_count += 1
+                        logger.error("No content generated from API")
                         return {'success': False, 'error': 'No content generated'}
                 
                 elif response.status == 429:
                     self.error_count += 1
                     error_text = await response.text()
+                    logger.error(f"API rate limit exceeded: {error_text}")
                     raise HTTPException(
                         status_code=429,
                         detail={
@@ -346,6 +386,7 @@ class GeminiProcessor:
                 else:
                     self.error_count += 1
                     error_text = await response.text()
+                    logger.error(f"API error {response.status}: {error_text}")
                     return {'success': False, 'error': f"API error {response.status}: {error_text}"}
                     
         except HTTPException:
@@ -353,11 +394,13 @@ class GeminiProcessor:
         except Exception as e:
             self.error_count += 1
             logger.error(f"Gemini API error: {e}")
+            logger.error(f"Traceback: {traceback.format_exc()}")
             return {'success': False, 'error': str(e)}
     
     async def paraphrase_text(self, text: str, num_variations: int = 3) -> Dict:
         """Generate paraphrases using Gemini with retry logic"""
         start_time = time.time()
+        logger.info(f"Starting paraphrasing for text: {text[:50]}...")
         
         system_instruction = f"""You are a professional paraphrasing assistant. Your task is to:
 1. Generate {num_variations} different paraphrases of the given text
@@ -374,6 +417,7 @@ class GeminiProcessor:
             
             if result['success']:
                 content = result['content']
+                logger.info(f"Paraphrasing successful, parsing {len(content)} characters")
                 
                 # Parse the numbered paraphrases
                 paraphrases = []
@@ -386,6 +430,8 @@ class GeminiProcessor:
                         if paraphrase and paraphrase.lower() != text.lower():
                             paraphrases.append(paraphrase)
                 
+                logger.info(f"Generated {len(paraphrases)} paraphrases")
+                
                 return {
                     'original_text': text,
                     'paraphrases': paraphrases[:num_variations],
@@ -395,6 +441,7 @@ class GeminiProcessor:
                     'tokens_used': result.get('tokens_used')
                 }
             else:
+                logger.error(f"Paraphrasing failed: {result.get('error', 'Unknown error')}")
                 raise HTTPException(
                     status_code=500,
                     detail=f"Paraphrasing failed: {result.get('error', 'Unknown error')}"
@@ -404,6 +451,7 @@ class GeminiProcessor:
             raise
         except Exception as e:
             logger.error(f"Paraphrasing error: {e}")
+            logger.error(f"Traceback: {traceback.format_exc()}")
             raise HTTPException(
                 status_code=500,
                 detail="Internal error during paraphrasing"
@@ -427,30 +475,56 @@ class GeminiProcessor:
     async def close(self):
         if self.session:
             await self.session.close()
+            logger.info("HTTP session closed")
 
-# Initialize components
-processor = GeminiProcessor()
-user_limiter = UserRateLimiter()
-request_queue = RequestQueue()
+# Initialize components with error handling
+try:
+    processor = GeminiProcessor()
+    logger.info("GeminiProcessor initialized successfully")
+except Exception as e:
+    logger.error(f"Failed to initialize GeminiProcessor: {e}")
+    raise
+
+try:
+    user_limiter = UserRateLimiter()
+    logger.info("UserRateLimiter initialized successfully")
+except Exception as e:
+    logger.error(f"Failed to initialize UserRateLimiter: {e}")
+    raise
+
+try:
+    request_queue = RequestQueue()
+    logger.info("RequestQueue initialized successfully")
+except Exception as e:
+    logger.error(f"Failed to initialize RequestQueue: {e}")
+    raise
 
 # Dependency functions
 async def check_user_rate_limit(request: Request):
-    user_id = user_limiter.get_user_id(request)
-    
-    if not user_limiter.check_user_limit(user_id):
-        remaining = user_limiter.get_user_remaining_requests(user_id)
-        raise HTTPException(
-            status_code=429,
-            detail={
-                "error": "Daily user limit exceeded",
-                "daily_limit": user_limiter.daily_limit_per_user,
-                "remaining_today": remaining,
-                "reset_time": "00:00 UTC tomorrow",
-                "suggestion": "Try again tomorrow or upgrade to premium"
-            }
-        )
-    
-    return user_id
+    try:
+        user_id = user_limiter.get_user_id(request)
+        logger.info(f"Checking rate limit for user: {user_id}")
+        
+        if not user_limiter.check_user_limit(user_id):
+            remaining = user_limiter.get_user_remaining_requests(user_id)
+            logger.warning(f"User {user_id} exceeded rate limit")
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "error": "Daily user limit exceeded",
+                    "daily_limit": user_limiter.daily_limit_per_user,
+                    "remaining_today": remaining,
+                    "reset_time": "00:00 UTC tomorrow",
+                    "suggestion": "Try again tomorrow or upgrade to premium"
+                }
+            )
+        
+        return user_id
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in rate limit check: {e}")
+        raise HTTPException(status_code=500, detail="Error checking rate limits")
 
 # FastAPI app
 app = FastAPI(
@@ -467,61 +541,101 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    logger.error(f"Global exception handler: {exc}")
+    logger.error(f"Traceback: {traceback.format_exc()}")
+    return {"error": "Internal server error", "detail": str(exc)}
+
+@app.get("/")
+async def root():
+    """Root endpoint for basic health check"""
+    return {
+        "message": "Enhanced Gemini Paraphraser API",
+        "version": "2.0.0",
+        "status": "running",
+        "endpoints": {
+            "health": "/health",
+            "paraphrase": "/paraphrase",
+            "docs": "/docs"
+        }
+    }
+
 @app.get("/health")
 async def health_check():
-    perf_stats = processor.get_performance_stats()
-    queue_status = request_queue.get_queue_status()
-    
-    return {
-        "status": "healthy",
-        "service": "Gemini API",
-        "model": processor.model,
-        "daily_requests_used": processor.daily_requests,
-        "minute_requests_used": processor.requests_count,
-        "user_daily_limit": user_limiter.daily_limit_per_user,
-        "queue_length": queue_status["queue_length"],
-        "success_rate": perf_stats["success_rate"],
-        "avg_response_time": perf_stats["avg_response_time"]
-    }
+    try:
+        perf_stats = processor.get_performance_stats()
+        queue_status = request_queue.get_queue_status()
+        
+        return {
+            "status": "healthy",
+            "service": "Gemini API",
+            "model": processor.model,
+            "daily_requests_used": processor.daily_requests,
+            "minute_requests_used": processor.requests_count,
+            "user_daily_limit": user_limiter.daily_limit_per_user,
+            "queue_length": queue_status["queue_length"],
+            "success_rate": perf_stats["success_rate"],
+            "avg_response_time": perf_stats["avg_response_time"],
+            "api_key_configured": bool(processor.api_key)
+        }
+    except Exception as e:
+        logger.error(f"Health check error: {e}")
+        return {
+            "status": "unhealthy",
+            "error": str(e)
+        }
 
 @app.get("/usage")
 async def usage_stats():
     """Get detailed usage statistics"""
-    perf_stats = processor.get_performance_stats()
-    queue_status = request_queue.get_queue_status()
-    
-    return {
-        "api_limits": {
-            "requests_this_minute": processor.requests_count,
-            "requests_today": processor.daily_requests,
-            "minute_limit": 10,
-            "daily_limit": 1200,
-            "minute_remaining": 10 - processor.requests_count,
-            "daily_remaining": 1200 - processor.daily_requests
-        },
-        "user_limits": {
-            "daily_limit_per_user": user_limiter.daily_limit_per_user
-        },
-        "performance": perf_stats,
-        "queue": queue_status
-    }
+    try:
+        perf_stats = processor.get_performance_stats()
+        queue_status = request_queue.get_queue_status()
+        
+        return {
+            "api_limits": {
+                "requests_this_minute": processor.requests_count,
+                "requests_today": processor.daily_requests,
+                "minute_limit": 10,
+                "daily_limit": 1200,
+                "minute_remaining": 10 - processor.requests_count,
+                "daily_remaining": 1200 - processor.daily_requests
+            },
+            "user_limits": {
+                "daily_limit_per_user": user_limiter.daily_limit_per_user
+            },
+            "performance": perf_stats,
+            "queue": queue_status
+        }
+    except Exception as e:
+        logger.error(f"Usage stats error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/user-status")
 async def user_status(request: Request):
     """Get user's current rate limit status"""
-    user_id = user_limiter.get_user_id(request)
-    return {
-        "user_id": user_id,
-        "daily_limit": user_limiter.daily_limit_per_user,
-        "requests_remaining": user_limiter.get_user_remaining_requests(user_id),
-        "failed_requests": user_limiter.failed_requests.get(user_id, 0),
-        "reset_time": "00:00 UTC tomorrow"
-    }
+    try:
+        user_id = user_limiter.get_user_id(request)
+        return {
+            "user_id": user_id,
+            "daily_limit": user_limiter.daily_limit_per_user,
+            "requests_remaining": user_limiter.get_user_remaining_requests(user_id),
+            "failed_requests": user_limiter.failed_requests.get(user_id, 0),
+            "reset_time": "00:00 UTC tomorrow"
+        }
+    except Exception as e:
+        logger.error(f"User status error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/queue-status")
 async def queue_status():
     """Get current queue status"""
-    return request_queue.get_queue_status()
+    try:
+        return request_queue.get_queue_status()
+    except Exception as e:
+        logger.error(f"Queue status error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/paraphrase", response_model=ParaphraseResponse)
 async def paraphrase_endpoint(
@@ -531,74 +645,82 @@ async def paraphrase_endpoint(
 ):
     """Generate paraphrases of the provided text with queue management"""
     try:
-        # Add to queue and wait for processing
+        logger.info(f"Paraphrase request from user {user_id}: {request_data.text[:50]}...")
+        
+        # Add to queue and wait for processing - this now returns the actual result dict
         result = await request_queue.add_request(request_data, user_id)
         
-        # Add user info to response
+        # Add user info to response (result is now a dict)
         result["user_requests_remaining"] = user_limiter.get_user_remaining_requests(user_id)
         
+        logger.info(f"Paraphrase request completed for user {user_id}")
         return ParaphraseResponse(**result)
         
     except Exception as e:
         # Log failed request but don't count against user limit
         user_limiter.log_failed_request(user_id)
         logger.error(f"Request failed for user {user_id}: {e}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
         raise
 
 @app.get("/metrics")
 async def metrics():
     """Get comprehensive metrics for monitoring"""
-    perf_stats = processor.get_performance_stats()
-    queue_status = request_queue.get_queue_status()
-    
-    return {
-        "timestamp": datetime.now().isoformat(),
-        "api_usage": {
-            "daily_requests": processor.daily_requests,
-            "daily_limit": 1200,
-            "daily_usage_percent": round((processor.daily_requests / 1200) * 100, 2),
-            "minute_requests": processor.requests_count,
-            "minute_limit": 10
-        },
-        "performance": perf_stats,
-        "queue": queue_status,
-        "system": {
-            "uptime": time.time() - processor.daily_reset,
-            "total_users_served": len(user_limiter.user_requests)
+    try:
+        perf_stats = processor.get_performance_stats()
+        queue_status = request_queue.get_queue_status()
+        
+        return {
+            "timestamp": datetime.now().isoformat(),
+            "api_usage": {
+                "daily_requests": processor.daily_requests,
+                "daily_limit": 1200,
+                "daily_usage_percent": round((processor.daily_requests / 1200) * 100, 2),
+                "minute_requests": processor.requests_count,
+                "minute_limit": 10
+            },
+            "performance": perf_stats,
+            "queue": queue_status,
+            "system": {
+                "uptime": time.time() - processor.daily_reset,
+                "total_users_served": len(user_limiter.user_requests)
+            }
         }
-    }
+    except Exception as e:
+        logger.error(f"Metrics error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.on_event("shutdown")
 async def shutdown_event():
     """Clean up resources on shutdown"""
-    await processor.close()
-    logger.info("Application shutdown complete")
+    try:
+        await processor.close()
+        logger.info("Application shutdown complete")
+    except Exception as e:
+        logger.error(f"Error during shutdown: {e}")
 
-# Add startup event
-@app.on_event("startup")
-async def startup_event():
-    """Log startup information"""
-    logger.info("🚀 Enhanced Gemini Paraphraser API starting...")
-    logger.info(f"📡 Using model: {processor.model}")
-    logger.info(f"👥 User limit: {user_limiter.daily_limit_per_user} requests/day")
-    logger.info(f"🔄 Queue system: Enabled")
     logger.info(f"⚡ Rate limits: 10/min, 1200/day")
+    logger.info("✅ Startup completed successfully")
 
 if __name__ == "__main__":
     import uvicorn
     
-    print("🚀 Starting Enhanced Gemini-Powered Paraphraser...")
-    print(f"📡 Using Google Gemini API: {processor.model}")
-    print(f"👥 User Rate Limit: {user_limiter.daily_limit_per_user} requests per day")
-    print(f"🔄 Queue System: Enabled")
-    print(f"⚡ Enhanced Rate Limits: 10/min, 1200/day")
-    print("🌐 FastAPI server ready!")
-    print("📚 API Documentation: http://127.0.0.1:8000/docs")
-    print("📊 Metrics: http://127.0.0.1:8000/metrics")
-    
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",  # Changed to accept external connections
-        port=int(os.getenv("PORT", 8000)),  # Use PORT env var for cloud deployment
-        reload=False  # Disabled for production
-    )
+    try:
+        print("🚀 Starting Enhanced Gemini-Powered Paraphraser...")
+        print(f"📡 Using Google Gemini API: {processor.model}")
+        print(f"👥 User Rate Limit: {user_limiter.daily_limit_per_user} requests per day")
+        print(f"🔄 Queue System: Enabled")
+        print(f"⚡ Enhanced Rate Limits: 10/min, 1200/day")
+        print("🌐 FastAPI server ready!")
+        print("📚 API Documentation: http://127.0.0.1:8000/docs")
+        print("📊 Metrics: http://127.0.0.1:8000/metrics")
+        
+        uvicorn.run(
+            "main:app",
+            host="0.0.0.0",  # Changed to accept external connections
+            port=int(os.getenv("PORT", 8000)),  # Use PORT env var for cloud deployment
+            reload=False  # Disabled for production
+        )
+    except Exception as e:
+        logger.error(f"Failed to start server: {e}")
+        print(f"❌ Server startup failed: {e}")
