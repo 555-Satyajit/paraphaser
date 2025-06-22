@@ -15,6 +15,7 @@ import json
 from dotenv import load_dotenv
 import random
 import traceback
+import redis
 
 # Configure logging with more detail
 logging.basicConfig(
@@ -29,6 +30,9 @@ try:
     logger.info("Environment variables loaded successfully")
 except Exception as e:
     logger.error(f"Error loading environment variables: {e}")
+    
+# Redis configuration for persistent rate limiting
+REDIS_URL = os.getenv('REDIS_URL', 'redis://localhost:6379')
 
 # Pydantic models
 class ParaphraseRequest(BaseModel):
@@ -129,16 +133,25 @@ class RequestQueue:
 
 class UserRateLimiter:
     def __init__(self):
-        # Track user requests by day
-        self.user_requests = defaultdict(lambda: {"count": 0, "date": None})
-        self.daily_limit_per_user = 10  # Reduced from 14 for safety buffer
+        # Initialize Redis connection
+        try:
+            self.redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+            # Test connection
+            self.redis_client.ping()
+            logger.info("Redis connection established successfully")
+        except Exception as e:
+            logger.error(f"Redis connection failed: {e}")
+            # Fallback to in-memory storage
+            self.redis_client = None
+            self.user_requests = defaultdict(lambda: {"count": 0, "date": None})
+            logger.warning("Falling back to in-memory rate limiting")
         
-        # Track failed requests to avoid wasting quota
+        self.daily_limit_per_user = 10
         self.failed_requests = defaultdict(int)
-        self.cleanup_interval = 3600  # Clean up old data every hour
+        self.cleanup_interval = 3600
         self.last_cleanup = time.time()
         logger.info(f"UserRateLimiter initialized with daily limit: {self.daily_limit_per_user}")
-
+    
     def cleanup_old_data(self):
         """Clean up old tracking data"""
         current_time = time.time()
@@ -161,38 +174,81 @@ class UserRateLimiter:
         """Check if user has exceeded daily limit"""
         self.cleanup_old_data()
         
+        if self.redis_client:
+            return self._check_user_limit_redis(user_id)
+        else:
+            return self._check_user_limit_memory(user_id)
+
+    def _check_user_limit_redis(self, user_id: str) -> bool:
+        """Redis-based rate limiting"""
+        today = datetime.now().date().isoformat()
+        key = f"user_requests:{user_id}:{today}"
+        
+        try:
+            current_count = self.redis_client.get(key)
+            current_count = int(current_count) if current_count else 0
+            
+            if current_count >= self.daily_limit_per_user:
+                logger.warning(f"User {user_id} exceeded daily limit (Redis)")
+                return False
+            
+            # Increment counter and set expiration
+            pipe = self.redis_client.pipeline()
+            pipe.incr(key)
+            pipe.expire(key, 86400)  # 24 hours
+            pipe.execute()
+            
+            logger.info(f"User {user_id} request count: {current_count + 1}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Redis error for user {user_id}: {e}")
+            # Fallback to allowing request
+            return True
+
+    def _check_user_limit_memory(self, user_id: str) -> bool:
+        """Fallback in-memory rate limiting"""
         today = datetime.now().date()
         user_data = self.user_requests[user_id]
         
-        # Reset counter if new day
         if user_data["date"] != today:
             user_data["count"] = 0
             user_data["date"] = today
         
-        # Check limit
         if user_data["count"] >= self.daily_limit_per_user:
-            logger.warning(f"User {user_id} exceeded daily limit")
+            logger.warning(f"User {user_id} exceeded daily limit (memory)")
             return False
         
-        # Increment counter
         user_data["count"] += 1
         return True
-    
+
     def get_user_remaining_requests(self, user_id: str) -> int:
         """Get remaining requests for user today"""
-        today = datetime.now().date()
-        user_data = self.user_requests[user_id]
-        
-        if user_data["date"] != today:
-            return self.daily_limit_per_user
-        
-        return max(0, self.daily_limit_per_user - user_data["count"])
-    
-    def log_failed_request(self, user_id: str):
-        """Log failed request (doesn't count against user limit)"""
-        self.failed_requests[user_id] += 1
-        logger.warning(f"Failed request logged for user {user_id}")
+        if self.redis_client:
+            try:
+                today = datetime.now().date().isoformat()
+                key = f"user_requests:{user_id}:{today}"
+                current_count = self.redis_client.get(key)
+                current_count = int(current_count) if current_count else 0
+                return max(0, self.daily_limit_per_user - current_count)
+            except Exception as e:
+                logger.error(f"Redis error getting remaining requests: {e}")
+                return self.daily_limit_per_user
+        else:
+            # Fallback to memory
+            today = datetime.now().date()
+            user_data = self.user_requests[user_id]
+            
+            if user_data["date"] != today:
+                return self.daily_limit_per_user
+            
+            return max(0, self.daily_limit_per_user - user_data["count"])
 
+    def log_failed_request(self, user_id: str):
+        """Log a failed request for the user"""
+        self.failed_requests[user_id] += 1
+        logger.info(f"Failed request logged for user {user_id}")
+    
 class GeminiProcessor:
     """Process text using Google Gemini API with improved error handling"""
     
@@ -683,7 +739,7 @@ async def metrics():
             "queue": queue_status,
             "system": {
                 "uptime": time.time() - processor.daily_reset,
-                "total_users_served": len(user_limiter.user_requests)
+                "total_users_served": len(user_limiter.user_requests) if not user_limiter.redis_client else "N/A (Redis)"
             }
         }
     except Exception as e:
@@ -699,8 +755,9 @@ async def shutdown_event():
     except Exception as e:
         logger.error(f"Error during shutdown: {e}")
 
-    logger.info(f"⚡ Rate limits: 10/min, 1200/day")
-    logger.info("✅ Startup completed successfully")
+# Move startup logging here, after all components are initialized
+logger.info(f"⚡ Rate limits: 10/min, 1200/day")
+logger.info("✅ Startup completed successfully")
 
 if __name__ == "__main__":
     import uvicorn
